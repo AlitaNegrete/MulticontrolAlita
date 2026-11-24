@@ -8,6 +8,7 @@ import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -23,6 +24,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.Window
 import android.widget.*
+import java.util.ArrayDeque
 import java.util.UUID
 
 class MainActivity : Activity() {
@@ -36,6 +38,7 @@ class MainActivity : Activity() {
     private var keyboardReportChar: BluetoothGattCharacteristic? = null
     private var mouseReportChar: BluetoothGattCharacteristic? = null
     private var protocolMode = byteArrayOf(0x01)
+    private val serviceQueue = ArrayDeque<BluetoothGattService>()
 
     private lateinit var statusDot: View
     private lateinit var statusText: TextView
@@ -50,7 +53,6 @@ class MainActivity : Activity() {
     private var isAdvertising = false
     private val pressedKeys = LinkedHashSet<Byte>()
 
-    // Control de flujo del mouse (cero drift y sensibilidad ajustable)
     private val mouseLock = Any()
     private var accDx = 0f
     private var accDy = 0f
@@ -69,6 +71,12 @@ class MainActivity : Activity() {
         }
     }
 
+    // Servicios estándar HOGP (HID sobre BLE)
+    private val UUID_DIS_SERVICE = UUID.fromString("0000180a-0000-1000-8000-00805f9b34fb")
+    private val UUID_PNP_ID = UUID.fromString("00002a50-0000-1000-8000-00805f9b34fb")
+    private val UUID_BAT_SERVICE = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
+    private val UUID_BAT_LEVEL = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
+
     private val UUID_HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb")
     private val UUID_HID_INFO = UUID.fromString("00002a4a-0000-1000-8000-00805f9b34fb")
     private val UUID_REPORT_MAP = UUID.fromString("00002a4b-0000-1000-8000-00805f9b34fb")
@@ -78,7 +86,6 @@ class MainActivity : Activity() {
     private val UUID_CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val UUID_REPORT_REF = UUID.fromString("00002908-0000-1000-8000-00805f9b34fb")
 
-    // Descriptor USB HID estándar: Report ID 1 = Teclado, Report ID 2 = Mouse
     private val hidDescriptor = byteArrayOf(
         // === Teclado (Report ID 1) ===
         0x05.toByte(), 0x01.toByte(),
@@ -170,7 +177,7 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#E5E7EB"))
             gravity = Gravity.CENTER
             background = roundedBg(fillHex, 10, "#343B52")
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setPadding(dp(9), dp(6), dp(9), dp(6))
             isClickable = true
             setOnClickListener { onClick() }
         }
@@ -183,7 +190,6 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(10), dp(12), dp(10))
         }
 
-        // Barra superior compacta: Estado + Controles
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -205,22 +211,29 @@ class MainActivity : Activity() {
         }
         topBar.addView(statusText)
 
-        // Control de sensibilidad del mouse
         val btnMinus = makePillButton("−") { adjustSpeed(-0.2f) }.apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                rightMargin = dp(4)
+                rightMargin = dp(3)
             }
         }
         speedLabel = TextView(this).apply {
             text = String.format("%.1fx", sensitivity)
             textSize = 12f
             setTextColor(Color.parseColor("#C4B5FD"))
-            setPadding(dp(4), 0, dp(4), 0)
+            setPadding(dp(3), 0, dp(3), 0)
         }
         val btnPlus = makePillButton("+") { adjustSpeed(0.2f) }.apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                leftMargin = dp(4)
-                rightMargin = dp(6)
+                leftMargin = dp(3)
+                rightMargin = dp(5)
+            }
+        }
+
+        val btnReconn = makePillButton("↺", "#1E3A4C") {
+            if (!isAdvertising) startBleHid() else tryReconnectLastHost(manual = true)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                rightMargin = dp(4)
             }
         }
 
@@ -249,14 +262,14 @@ class MainActivity : Activity() {
         topBar.addView(btnMinus)
         topBar.addView(speedLabel)
         topBar.addView(btnPlus)
+        topBar.addView(btnReconn)
         topBar.addView(btnBle)
         topBar.addView(btnLog)
         topBar.addView(btnHelp)
         root.addView(topBar)
 
-        // Botón principal estilizado para controlar la Y700
         captureZone = TextView(this).apply {
-            text = "CONTROLAR Y700\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
+            text = "CONTROLAR Y700\nEsperando conexión BLE..."
             textSize = 14f
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
@@ -279,7 +292,6 @@ class MainActivity : Activity() {
         }
         root.addView(captureZone)
 
-        // Consola de logs oculta por defecto
         logText = TextView(this).apply {
             textSize = 11f
             typeface = Typeface.MONOSPACE
@@ -296,30 +308,28 @@ class MainActivity : Activity() {
         }
         root.addView(logScroll)
 
-        // Mini-manual oculto por defecto (se abre con el botón "?")
         val helpText = TextView(this).apply {
             textSize = 12f
             setTextColor(Color.parseColor("#E5E7EB"))
             setLineSpacing(dp(2).toFloat(), 1.0f)
             setPadding(dp(12), dp(10), dp(12), dp(10))
             text = """
-                MÉTODO DE USO RÁPIDO
-                1. Abre esta app primero y revisa que diga BLE ON.
-                2. Si no se conecta sola, entra al Bluetooth de la Y700 y toca esta tablet.
-                3. Cuando el punto esté verde, toca el botón azul para controlar.
-                4. Para volver aquí: Ctrl + Shift + Espacio (o toca el botón verde con el dedo).
+                USO DIARIO / AL VOLVER DE UN BREAK
+                1. Deja esta app abierta en BLE ON.
+                2. Toca ↺ para buscar la Y700, o toca esta tablet en el Bluetooth de la Y700.
+                3. Cuando el punto esté verde, toca el botón azul. Salir: Ctrl + Shift + Espacio.
 
-                SI NO APARECE EL CURSOR / SE CONECTA MAL
-                1. En Bluetooth, dale a OLVIDAR en AMBAS tablets (Tab S6 y Y700).
-                2. Abre esta app (BLE ON y punto amarillo).
-                3. Busca y empareja SIEMPRE desde el Bluetooth de la Y700 (nunca desde los ajustes BT de esta tablet).
+                PRIMER EMPAREJAMIENTO (CLAVE)
+                1. Olvida el vínculo anterior en AMBAS tablets (y NO abras Ajustes BT en la Tab S6).
+                2. Abre esta app (BLE ON) y busca desde la Y700.
+                3. Elige el ícono de BLUETOOTH (nunca el de llamada/celular) y acepta vincular.
             """.trimIndent()
         }
         helpScroll = ScrollView(this).apply {
             background = roundedBg("#161D2F", 10, "#3B5284")
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(150)
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(155)
             ).apply { topMargin = dp(10) }
             addView(helpText)
         }
@@ -334,6 +344,25 @@ class MainActivity : Activity() {
         log("Velocidad mouse: ${speedLabel.text}")
     }
 
+    private fun updateCaptureZoneUi() {
+        runOnUiThread {
+            when {
+                isCapturing -> {
+                    captureZone.background = roundedBg("#116B52", 14, "#34D399")
+                    captureZone.text = "CONTROLANDO Y700\nSalir: Ctrl + Shift + Espacio (o toca aquí)"
+                }
+                connectedHost != null -> {
+                    captureZone.background = roundedBg("#243056", 14, "#4C63A6")
+                    captureZone.text = "CONTROLAR Y700\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
+                }
+                else -> {
+                    captureZone.background = roundedBg("#1E2230", 14, "#374151")
+                    captureZone.text = "SIN CONEXIÓN\nToca ↺ o conecta desde la Y700"
+                }
+            }
+        }
+    }
+
     private fun updateStatus(text: String, dotHex: String) {
         runOnUiThread {
             statusText.text = text
@@ -341,6 +370,7 @@ class MainActivity : Activity() {
             btnBle.text = if (isAdvertising) "BLE ON" else "BLE OFF"
             btnBle.background = roundedBg(if (isAdvertising) "#3B2866" else "#232736", 10, "#5B4499")
         }
+        updateCaptureZoneUi()
     }
 
     private fun log(msg: String) {
@@ -348,6 +378,16 @@ class MainActivity : Activity() {
             logText.append("• $msg\n")
             logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
         }
+    }
+
+    private fun saveLastHost(address: String) {
+        getSharedPreferences("multicontrol_prefs", Context.MODE_PRIVATE)
+            .edit().putString("last_host_addr", address).apply()
+    }
+
+    private fun getLastHostAddress(): String? {
+        return getSharedPreferences("multicontrol_prefs", Context.MODE_PRIVATE)
+            .getString("last_host_addr", null)
     }
 
     private fun hasBtPermissions(): Boolean {
@@ -381,7 +421,7 @@ class MainActivity : Activity() {
     @SuppressLint("MissingPermission")
     private fun startBleHid() {
         if (!hasBtPermissions()) return
-        if (isAdvertising) return
+        if (gattServer != null) return
 
         val server = btManager?.openGattServer(this, gattCallback)
         if (server == null) {
@@ -390,46 +430,84 @@ class MainActivity : Activity() {
             return
         }
         gattServer = server
+        serviceQueue.clear()
 
+        // 1. Device Information Service (PnP ID)
+        val disService = BluetoothGattService(UUID_DIS_SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY).apply {
+            addCharacteristic(
+                BluetoothGattCharacteristic(
+                    UUID_PNP_ID,
+                    BluetoothGattCharacteristic.PROPERTY_READ,
+                    BluetoothGattCharacteristic.PERMISSION_READ
+                )
+            )
+        }
+
+        // 2. Battery Service
+        val batService = BluetoothGattService(UUID_BAT_SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY).apply {
+            addCharacteristic(
+                BluetoothGattCharacteristic(
+                    UUID_BAT_LEVEL,
+                    BluetoothGattCharacteristic.PROPERTY_READ,
+                    BluetoothGattCharacteristic.PERMISSION_READ
+                )
+            )
+        }
+
+        // 3. HID Service con cifrado obligatorio para guardar llave BLE permanente
         val hidService = BluetoothGattService(UUID_HID_SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
 
         val hidInfo = BluetoothGattCharacteristic(
             UUID_HID_INFO,
             BluetoothGattCharacteristic.PROPERTY_READ,
-            BluetoothGattCharacteristic.PERMISSION_READ
+            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
         )
         val reportMap = BluetoothGattCharacteristic(
             UUID_REPORT_MAP,
             BluetoothGattCharacteristic.PROPERTY_READ,
-            BluetoothGattCharacteristic.PERMISSION_READ
+            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
         )
         val controlPoint = BluetoothGattCharacteristic(
             UUID_CONTROL_POINT,
             BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
-            BluetoothGattCharacteristic.PERMISSION_WRITE
+            BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED
         )
         val protoMode = BluetoothGattCharacteristic(
             UUID_PROTOCOL_MODE,
             BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
-            BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
+            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED or BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED
         )
 
         keyboardReportChar = BluetoothGattCharacteristic(
             UUID_REPORT,
             BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ
+            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
         ).apply {
-            addDescriptor(BluetoothGattDescriptor(UUID_CCCD, BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE))
-            addDescriptor(BluetoothGattDescriptor(UUID_REPORT_REF, BluetoothGattDescriptor.PERMISSION_READ))
+            addDescriptor(
+                BluetoothGattDescriptor(
+                    UUID_CCCD,
+                    BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
+                )
+            )
+            addDescriptor(
+                BluetoothGattDescriptor(UUID_REPORT_REF, BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED)
+            )
         }
 
         mouseReportChar = BluetoothGattCharacteristic(
             UUID_REPORT,
             BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ
+            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
         ).apply {
-            addDescriptor(BluetoothGattDescriptor(UUID_CCCD, BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE))
-            addDescriptor(BluetoothGattDescriptor(UUID_REPORT_REF, BluetoothGattDescriptor.PERMISSION_READ))
+            addDescriptor(
+                BluetoothGattDescriptor(
+                    UUID_CCCD,
+                    BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
+                )
+            )
+            addDescriptor(
+                BluetoothGattDescriptor(UUID_REPORT_REF, BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED)
+            )
         }
 
         hidService.addCharacteristic(hidInfo)
@@ -439,8 +517,27 @@ class MainActivity : Activity() {
         hidService.addCharacteristic(keyboardReportChar)
         hidService.addCharacteristic(mouseReportChar)
 
-        server.addService(hidService)
+        serviceQueue.add(disService)
+        serviceQueue.add(batService)
+        serviceQueue.add(hidService)
 
+        updateStatus("Cargando HID...", "#F59E0B")
+        addNextServiceOrAdvertise()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun addNextServiceOrAdvertise() {
+        val server = gattServer ?: return
+        val next = serviceQueue.poll()
+        if (next != null) {
+            server.addService(next)
+        } else {
+            startAdvertisingNow()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startAdvertisingNow() {
         advertiser = btAdapter?.bluetoothLeAdvertiser
         if (advertiser == null) {
             updateStatus("Sin soporte BLE", "#EF4444")
@@ -466,11 +563,34 @@ class MainActivity : Activity() {
     }
 
     @SuppressLint("MissingPermission")
+    private fun tryReconnectLastHost(manual: Boolean = false) {
+        if (!hasBtPermissions() || gattServer == null) return
+        val addr = getLastHostAddress()
+        if (addr == null) {
+            if (manual) log("Aún no hay Y700 guardada. Vincula desde la Y700 primero.")
+            return
+        }
+        try {
+            val bonded = btAdapter?.bondedDevices?.firstOrNull { it.address == addr }
+            if (bonded != null) {
+                gattServer?.connect(bonded, true)
+                log("Buscando reconexión con ${bonded.name ?: addr}...")
+            } else if (manual) {
+                log("La Y700 no figura vinculada en BLE. Conecta desde la Y700.")
+            }
+        } catch (e: Exception) {
+            if (manual) log("No se pudo iniciar reconexión: ${e.message}")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private fun stopBleHid() {
         try {
+            if (isCapturing) releaseCapture()
             if (isAdvertising) advertiser?.stopAdvertising(advertiseCallback)
             gattServer?.close()
         } catch (_: Exception) {}
+        serviceQueue.clear()
         isAdvertising = false
         gattServer = null
         connectedHost = null
@@ -483,7 +603,8 @@ class MainActivity : Activity() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
             isAdvertising = true
             updateStatus("Listo (esperando Y700)", "#F59E0B")
-            log("Señal BLE activa. Conecta desde el Bluetooth de la Y700.")
+            log("Servicios HOGP listos. Señal BLE activa.")
+            tryReconnectLastHost(manual = false)
         }
 
         override fun onStartFailure(errorCode: Int) {
@@ -495,16 +616,27 @@ class MainActivity : Activity() {
 
     @SuppressLint("MissingPermission")
     private val gattCallback = object : BluetoothGattServerCallback() {
+        override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                log("Aviso al cargar servicio ${service.uuid}: $status")
+            }
+            mainHandler.post { addNextServiceOrAdvertise() }
+        }
+
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 connectedHost = device
                 isBleBusy = false
+                saveLastHost(device.address)
                 val name = device.name ?: "Y700"
                 updateStatus("Conectado: $name", "#10B981")
                 log("Conectado con $name")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (connectedHost?.address == device.address) connectedHost = null
                 isBleBusy = false
+                runOnUiThread {
+                    if (isCapturing) releaseCapture()
+                }
                 updateStatus(if (isAdvertising) "Listo (esperando Y700)" else "Desconectado", "#F59E0B")
                 log("Desconectado de ${device.name ?: device.address}")
             }
@@ -518,6 +650,8 @@ class MainActivity : Activity() {
             device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic
         ) {
             val fullData = when (characteristic.uuid) {
+                UUID_PNP_ID -> byteArrayOf(0x02, 0x05, 0x05, 0x01, 0x00, 0x01, 0x00)
+                UUID_BAT_LEVEL -> byteArrayOf(100.toByte())
                 UUID_HID_INFO -> byteArrayOf(0x11, 0x01, 0x00, 0x02)
                 UUID_REPORT_MAP -> hidDescriptor
                 UUID_PROTOCOL_MODE -> protocolMode
@@ -569,6 +703,11 @@ class MainActivity : Activity() {
     }
 
     private fun startCapture() {
+        if (connectedHost == null) {
+            log("No hay tablet conectada todavía. Toca ↺ o conecta desde la Y700.")
+            updateCaptureZoneUi()
+            return
+        }
         synchronized(mouseLock) {
             accDx = 0f
             accDy = 0f
@@ -581,7 +720,9 @@ class MainActivity : Activity() {
     }
 
     private fun releaseCapture() {
-        captureZone.releasePointerCapture()
+        try {
+            captureZone.releasePointerCapture()
+        } catch (_: Exception) {}
         synchronized(mouseLock) {
             accDx = 0f
             accDy = 0f
@@ -597,15 +738,7 @@ class MainActivity : Activity() {
     override fun onPointerCaptureChanged(hasCapture: Boolean) {
         super.onPointerCaptureChanged(hasCapture)
         isCapturing = hasCapture
-        runOnUiThread {
-            if (hasCapture) {
-                captureZone.background = roundedBg("#116B52", 14, "#34D399")
-                captureZone.text = "CONTROLANDO Y700\nSalir: Ctrl + Shift + Espacio (o toca aquí)"
-            } else {
-                captureZone.background = roundedBg("#243056", 14, "#4C63A6")
-                captureZone.text = "CONTROLAR Y700\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
-            }
-        }
+        updateCaptureZoneUi()
     }
 
     @Suppress("DEPRECATION")
