@@ -56,7 +56,7 @@ class MainActivity : Activity() {
     private var accWheel = 0f
     private var currentButtons = 0
     private var lastSentButtons = 0
-    private var sensitivity = 1.6f
+    private var sensitivity = 1.0f
     @Volatile private var isBleBusy = false
     @Volatile private var lastSendTime = 0L
 
@@ -205,7 +205,7 @@ class MainActivity : Activity() {
         topBar.addView(statusText)
 
         // Control de sensibilidad del mouse
-        val btnMinus = makePillButton("−") { adjustSpeed(-0.3f) }.apply {
+        val btnMinus = makePillButton("−") { adjustSpeed(-0.2f) }.apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                 rightMargin = dp(4)
             }
@@ -216,7 +216,7 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#C4B5FD"))
             setPadding(dp(4), 0, dp(4), 0)
         }
-        val btnPlus = makePillButton("+") { adjustSpeed(0.3f) }.apply {
+        val btnPlus = makePillButton("+") { adjustSpeed(0.2f) }.apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                 leftMargin = dp(4)
                 rightMargin = dp(8)
@@ -242,9 +242,9 @@ class MainActivity : Activity() {
         topBar.addView(btnLog)
         root.addView(topBar)
 
-        // Botón principal estilizado para controlar la Y700
+        // Botón principal estilizado para controlar la Tablet Secundaria
         captureZone = TextView(this).apply {
-            text = "CONTROLAR Y700\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
+            text = "CONTROLAR TABLET SECUNDARIA\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
             textSize = 14f
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
@@ -441,8 +441,8 @@ class MainActivity : Activity() {
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
             isAdvertising = true
-            updateStatus("Listo (esperando Y700)", "#F59E0B")
-            log("Señal BLE activa. Conecta desde el Bluetooth de la Y700.")
+            updateStatus("Listo (esperando Tablet Secundaria)", "#F59E0B")
+            log("Señal BLE activa. Conecta desde la Tablet Secundaria.")
         }
 
         override fun onStartFailure(errorCode: Int) {
@@ -458,13 +458,13 @@ class MainActivity : Activity() {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 connectedHost = device
                 isBleBusy = false
-                val name = device.name ?: "Y700"
+                val name = device.name ?: "Tablet Secundaria"
                 updateStatus("Conectado: $name", "#10B981")
                 log("Conectado con $name")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (connectedHost?.address == device.address) connectedHost = null
                 isBleBusy = false
-                updateStatus(if (isAdvertising) "Listo (esperando Y700)" else "Desconectado", "#F59E0B")
+                updateStatus(if (isAdvertising) "Listo (esperando Tablet Secundaria)" else "Desconectado", "#F59E0B")
                 log("Desconectado de ${device.name ?: device.address}")
             }
         }
@@ -559,10 +559,10 @@ class MainActivity : Activity() {
         runOnUiThread {
             if (hasCapture) {
                 captureZone.background = roundedBg("#116B52", 14, "#34D399")
-                captureZone.text = "CONTROLANDO Y700\nSalir: Ctrl + Shift + Espacio (o toca aquí)"
+                captureZone.text = "CONTROLANDO TABLET SECUNDARIA\nSalir: Ctrl + Shift + Espacio (o toca aquí)"
             } else {
                 captureZone.background = roundedBg("#243056", 14, "#4C63A6")
-                captureZone.text = "CONTROLAR Y700\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
+                captureZone.text = "CONTROLAR TABLET SECUNDARIA\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
             }
         }
     }
