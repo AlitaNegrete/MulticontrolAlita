@@ -44,6 +44,7 @@ class MainActivity : Activity() {
     private lateinit var captureZone: TextView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
+    private lateinit var helpScroll: ScrollView
 
     private var isCapturing = false
     private var isAdvertising = false
@@ -56,7 +57,7 @@ class MainActivity : Activity() {
     private var accWheel = 0f
     private var currentButtons = 0
     private var lastSentButtons = 0
-    private var sensitivity = 1.6f
+    private var sensitivity = 1.0f
     @Volatile private var isBleBusy = false
     @Volatile private var lastSendTime = 0L
 
@@ -205,7 +206,7 @@ class MainActivity : Activity() {
         topBar.addView(statusText)
 
         // Control de sensibilidad del mouse
-        val btnMinus = makePillButton("−") { adjustSpeed(-0.3f) }.apply {
+        val btnMinus = makePillButton("−") { adjustSpeed(-0.2f) }.apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                 rightMargin = dp(4)
             }
@@ -216,10 +217,10 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#C4B5FD"))
             setPadding(dp(4), 0, dp(4), 0)
         }
-        val btnPlus = makePillButton("+") { adjustSpeed(0.3f) }.apply {
+        val btnPlus = makePillButton("+") { adjustSpeed(0.2f) }.apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                 leftMargin = dp(4)
-                rightMargin = dp(8)
+                rightMargin = dp(6)
             }
         }
 
@@ -227,12 +228,22 @@ class MainActivity : Activity() {
             if (isAdvertising) stopBleHid() else startBleHid()
         }.apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                rightMargin = dp(6)
+                rightMargin = dp(4)
             }
         }
 
         val btnLog = makePillButton("Log") {
+            helpScroll.visibility = View.GONE
             logScroll.visibility = if (logScroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                rightMargin = dp(4)
+            }
+        }
+
+        val btnHelp = makePillButton("?", "#1F3A5F") {
+            logScroll.visibility = View.GONE
+            helpScroll.visibility = if (helpScroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
 
         topBar.addView(btnMinus)
@@ -240,6 +251,7 @@ class MainActivity : Activity() {
         topBar.addView(btnPlus)
         topBar.addView(btnBle)
         topBar.addView(btnLog)
+        topBar.addView(btnHelp)
         root.addView(topBar)
 
         // Botón principal estilizado para controlar la Y700
@@ -267,7 +279,7 @@ class MainActivity : Activity() {
         }
         root.addView(captureZone)
 
-        // Consola de logs oculta por defecto para que la ventana sea una mini-barra
+        // Consola de logs oculta por defecto
         logText = TextView(this).apply {
             textSize = 11f
             typeface = Typeface.MONOSPACE
@@ -278,11 +290,40 @@ class MainActivity : Activity() {
             background = roundedBg("#161923", 10, "#262B3D")
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(120)
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(130)
             ).apply { topMargin = dp(10) }
             addView(logText)
         }
         root.addView(logScroll)
+
+        // Mini-manual oculto por defecto (se abre con el botón "?")
+        val helpText = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.parseColor("#E5E7EB"))
+            setLineSpacing(dp(2).toFloat(), 1.0f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            text = """
+                MÉTODO DE USO RÁPIDO
+                1. Abre esta app primero y revisa que diga BLE ON.
+                2. Si no se conecta sola, entra al Bluetooth de la Y700 y toca esta tablet.
+                3. Cuando el punto esté verde, toca el botón azul para controlar.
+                4. Para volver aquí: Ctrl + Shift + Espacio (o toca el botón verde con el dedo).
+
+                SI NO APARECE EL CURSOR / SE CONECTA MAL
+                1. En Bluetooth, dale a OLVIDAR en AMBAS tablets (Tab S6 y Y700).
+                2. Abre esta app (BLE ON y punto amarillo).
+                3. Busca y empareja SIEMPRE desde el Bluetooth de la Y700 (nunca desde los ajustes BT de esta tablet).
+            """.trimIndent()
+        }
+        helpScroll = ScrollView(this).apply {
+            background = roundedBg("#161D2F", 10, "#3B5284")
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(150)
+            ).apply { topMargin = dp(10) }
+            addView(helpText)
+        }
+        root.addView(helpScroll)
 
         setContentView(root)
     }
