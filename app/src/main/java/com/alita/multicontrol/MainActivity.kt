@@ -11,13 +11,17 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.Window
 import android.widget.*
 import java.util.UUID
 
@@ -33,6 +37,10 @@ class MainActivity : Activity() {
     private var mouseReportChar: BluetoothGattCharacteristic? = null
     private var protocolMode = byteArrayOf(0x01)
 
+    private lateinit var statusDot: View
+    private lateinit var statusText: TextView
+    private lateinit var btnBle: TextView
+    private lateinit var speedLabel: TextView
     private lateinit var captureZone: TextView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
@@ -40,6 +48,25 @@ class MainActivity : Activity() {
     private var isCapturing = false
     private var isAdvertising = false
     private val pressedKeys = LinkedHashSet<Byte>()
+
+    // Control de flujo del mouse (cero drift y sensibilidad ajustable)
+    private val mouseLock = Any()
+    private var accDx = 0f
+    private var accDy = 0f
+    private var accWheel = 0f
+    private var currentButtons = 0
+    private var lastSentButtons = 0
+    private var sensitivity = 1.6f
+    @Volatile private var isBleBusy = false
+    @Volatile private var lastSendTime = 0L
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mouseTicker = object : Runnable {
+        override fun run() {
+            flushMouseReport()
+            mainHandler.postDelayed(this, 14L)
+        }
+    }
 
     private val UUID_HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb")
     private val UUID_HID_INFO = UUID.fromString("00002a4a-0000-1000-8000-00805f9b34fb")
@@ -110,59 +137,126 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestWindowFeature(Window.FEATURE_NO_TITLE)
         btManager = getSystemService(BluetoothManager::class.java)
         btAdapter = btManager?.adapter
         buildUi()
         checkAndRequestPermissions()
+        mainHandler.post(mouseTicker)
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        mainHandler.removeCallbacks(mouseTicker)
         stopBleHid()
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun roundedBg(fillHex: String, radiusDp: Int, strokeHex: String? = null): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(Color.parseColor(fillHex))
+            cornerRadius = dp(radiusDp).toFloat()
+            if (strokeHex != null) setStroke(dp(1), Color.parseColor(strokeHex))
+        }
+    }
+
+    private fun makePillButton(label: String, fillHex: String = "#232736", onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            text = label
+            textSize = 12f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#E5E7EB"))
+            gravity = Gravity.CENTER
+            background = roundedBg(fillHex, 10, "#343B52")
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
     }
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#121212"))
-            setPadding(32, 32, 32, 32)
+            setBackgroundColor(Color.parseColor("#0F1117"))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
         }
 
-        val title = TextView(this).apply {
-            text = "MulticontrolAlita — BLE HID (No desconecta periféricos)"
-            textSize = 20f
+        // Barra superior compacta: Estado + Controles
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        statusDot = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(10), dp(10)).apply { rightMargin = dp(8) }
+            background = roundedBg("#6B7280", 10)
+        }
+        topBar.addView(statusDot)
+
+        statusText = TextView(this).apply {
+            text = "Iniciando..."
+            textSize = 13f
             setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            setPadding(0, 0, 0, 20)
+            setTextColor(Color.parseColor("#E5E7EB"))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            maxLines = 1
         }
-        root.addView(title)
+        topBar.addView(statusText)
 
-        val rowTop = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val btnStart = Button(this).apply {
-            text = "1. Emitir señal BLE"
-            setOnClickListener { startBleHid() }
+        // Control de sensibilidad del mouse
+        val btnMinus = makePillButton("−") { adjustSpeed(-0.3f) }.apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                rightMargin = dp(4)
+            }
         }
-        val btnStop = Button(this).apply {
-            text = "Detener señal"
-            setOnClickListener { stopBleHid() }
+        speedLabel = TextView(this).apply {
+            text = String.format("%.1fx", sensitivity)
+            textSize = 12f
+            setTextColor(Color.parseColor("#C4B5FD"))
+            setPadding(dp(4), 0, dp(4), 0)
         }
-        rowTop.addView(btnStart)
-        rowTop.addView(btnStop)
-        root.addView(rowTop)
+        val btnPlus = makePillButton("+") { adjustSpeed(0.3f) }.apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                leftMargin = dp(4)
+                rightMargin = dp(8)
+            }
+        }
 
+        btnBle = makePillButton("BLE", "#2D254C") {
+            if (isAdvertising) stopBleHid() else startBleHid()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                rightMargin = dp(6)
+            }
+        }
+
+        val btnLog = makePillButton("Log") {
+            logScroll.visibility = if (logScroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+
+        topBar.addView(btnMinus)
+        topBar.addView(speedLabel)
+        topBar.addView(btnPlus)
+        topBar.addView(btnBle)
+        topBar.addView(btnLog)
+        root.addView(topBar)
+
+        // Botón principal estilizado para controlar la Y700
         captureZone = TextView(this).apply {
-            text = "2. TOCA AQUÍ PARA CONTROLAR LA Y700\n(Para volver a la Tab S6: Ctrl + Shift + Espacio o toca aquí con el dedo)"
-            textSize = 16f
+            text = "CONTROLAR Y700\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#1F3A5F"))
-            setPadding(24, 48, 24, 48)
+            background = roundedBg("#243056", 14, "#4C63A6")
+            setPadding(dp(16), dp(18), dp(16), dp(18))
             isFocusable = true
             isFocusableInTouchMode = true
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = 20 }
+            ).apply { topMargin = dp(10) }
             setOnClickListener {
                 if (isCapturing) releaseCapture() else startCapture()
             }
@@ -173,22 +267,39 @@ class MainActivity : Activity() {
         }
         root.addView(captureZone)
 
+        // Consola de logs oculta por defecto para que la ventana sea una mini-barra
         logText = TextView(this).apply {
-            textSize = 12f
+            textSize = 11f
             typeface = Typeface.MONOSPACE
-            setTextColor(Color.parseColor("#A8E6CF"))
-            setPadding(16, 16, 16, 16)
+            setTextColor(Color.parseColor("#A7F3D0"))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
         }
         logScroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#1E1E1E"))
+            background = roundedBg("#161923", 10, "#262B3D")
+            visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            ).apply { topMargin = 20 }
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(120)
+            ).apply { topMargin = dp(10) }
             addView(logText)
         }
         root.addView(logScroll)
 
         setContentView(root)
+    }
+
+    private fun adjustSpeed(delta: Float) {
+        sensitivity = (sensitivity + delta).coerceIn(0.4f, 4.0f)
+        speedLabel.text = String.format("%.1fx", sensitivity)
+        log("Velocidad mouse: ${speedLabel.text}")
+    }
+
+    private fun updateStatus(text: String, dotHex: String) {
+        runOnUiThread {
+            statusText.text = text
+            statusDot.background = roundedBg(dotHex, 10)
+            btnBle.text = if (isAdvertising) "BLE ON" else "BLE OFF"
+            btnBle.background = roundedBg(if (isAdvertising) "#3B2866" else "#232736", 10, "#5B4499")
+        }
     }
 
     private fun log(msg: String) {
@@ -212,32 +323,28 @@ class MainActivity : Activity() {
                 100
             )
         } else {
-            log("Permisos Bluetooth OK. Toca '1. Emitir señal BLE' para comenzar.")
+            startBleHid()
         }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (hasBtPermissions()) {
-            log("Permisos concedidos. Toca '1. Emitir señal BLE'.")
+            startBleHid()
         } else {
-            log("ERROR: Faltan permisos de Dispositivos Cercanos (Bluetooth).")
+            updateStatus("Sin permiso BT", "#EF4444")
+            log("ERROR: Faltan permisos de Dispositivos Cercanos.")
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun startBleHid() {
-        if (!hasBtPermissions()) {
-            log("Faltan permisos Bluetooth.")
-            return
-        }
-        if (isAdvertising) {
-            log("La señal BLE ya está activa.")
-            return
-        }
+        if (!hasBtPermissions()) return
+        if (isAdvertising) return
 
         val server = btManager?.openGattServer(this, gattCallback)
         if (server == null) {
+            updateStatus("Error GATT", "#EF4444")
             log("ERROR: No se pudo abrir el servidor GATT BLE.")
             return
         }
@@ -291,12 +398,11 @@ class MainActivity : Activity() {
         hidService.addCharacteristic(keyboardReportChar)
         hidService.addCharacteristic(mouseReportChar)
 
-        val added = server.addService(hidService)
-        log("Servicio BLE HID agregado: $added")
+        server.addService(hidService)
 
         advertiser = btAdapter?.bluetoothLeAdvertiser
         if (advertiser == null) {
-            log("ERROR: Esta tablet no soporta emisión BLE (Advertiser null).")
+            updateStatus("Sin soporte BLE", "#EF4444")
             return
         }
 
@@ -327,17 +433,21 @@ class MainActivity : Activity() {
         isAdvertising = false
         gattServer = null
         connectedHost = null
+        isBleBusy = false
+        updateStatus("BLE detenido", "#6B7280")
         log("Señal BLE detenida.")
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
             isAdvertising = true
-            log("SEÑAL BLE ACTIVA. Ahora busca esta Tab S6 desde el Bluetooth de la Lenovo Y700 y conéctala.")
+            updateStatus("Listo (esperando Y700)", "#F59E0B")
+            log("Señal BLE activa. Conecta desde el Bluetooth de la Y700.")
         }
 
         override fun onStartFailure(errorCode: Int) {
             isAdvertising = false
+            updateStatus("Error BLE ($errorCode)", "#EF4444")
             log("ERROR al emitir señal BLE (código $errorCode).")
         }
     }
@@ -347,11 +457,20 @@ class MainActivity : Activity() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 connectedHost = device
-                log("CONECTADO con ${device.name ?: device.address}")
+                isBleBusy = false
+                val name = device.name ?: "Y700"
+                updateStatus("Conectado: $name", "#10B981")
+                log("Conectado con $name")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (connectedHost?.address == device.address) connectedHost = null
-                log("DESCONECTADO de ${device.name ?: device.address}")
+                isBleBusy = false
+                updateStatus(if (isAdvertising) "Listo (esperando Y700)" else "Desconectado", "#F59E0B")
+                log("Desconectado de ${device.name ?: device.address}")
             }
+        }
+
+        override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
+            isBleBusy = false
         }
 
         override fun onCharacteristicReadRequest(
@@ -403,14 +522,18 @@ class MainActivity : Activity() {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
             }
             if (descriptor.uuid == UUID_CCCD) {
-                log("Canal HID listo para recibir teclado y mouse.")
+                log("Canal HID listo.")
             }
         }
     }
 
     private fun startCapture() {
-        if (connectedHost == null) {
-            log("Aviso: aún no se conecta la Y700, pero activando captura de prueba...")
+        synchronized(mouseLock) {
+            accDx = 0f
+            accDy = 0f
+            accWheel = 0f
+            currentButtons = 0
+            lastSentButtons = 0
         }
         captureZone.requestFocus()
         captureZone.requestPointerCapture()
@@ -418,8 +541,16 @@ class MainActivity : Activity() {
 
     private fun releaseCapture() {
         captureZone.releasePointerCapture()
+        synchronized(mouseLock) {
+            accDx = 0f
+            accDy = 0f
+            accWheel = 0f
+            currentButtons = 0
+            lastSentButtons = 0
+        }
         pressedKeys.clear()
         sendKeyReport(0)
+        sendBleReport(mouseReportChar, byteArrayOf(0, 0, 0, 0), trackBusy = false)
     }
 
     override fun onPointerCaptureChanged(hasCapture: Boolean) {
@@ -427,48 +558,88 @@ class MainActivity : Activity() {
         isCapturing = hasCapture
         runOnUiThread {
             if (hasCapture) {
-                captureZone.setBackgroundColor(Color.parseColor("#1E6F50"))
-                captureZone.text = "CONTROLANDO LA Y700\n(Ctrl + Shift + Espacio o toca aquí con el dedo para volver)"
-                log("Captura ACTIVA: mouse y teclado redirigidos.")
+                captureZone.background = roundedBg("#116B52", 14, "#34D399")
+                captureZone.text = "CONTROLANDO Y700\nSalir: Ctrl + Shift + Espacio (o toca aquí)"
             } else {
-                captureZone.setBackgroundColor(Color.parseColor("#1F3A5F"))
-                captureZone.text = "2. TOCA AQUÍ PARA CONTROLAR LA Y700\n(Para volver a la Tab S6: Ctrl + Shift + Espacio o toca aquí con el dedo)"
-                log("Captura LIBERADA: control devuelto a Tab S6.")
+                captureZone.background = roundedBg("#243056", 14, "#4C63A6")
+                captureZone.text = "CONTROLAR Y700\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
             }
         }
     }
 
     @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission")
-    private fun sendBleReport(char: BluetoothGattCharacteristic?, data: ByteArray) {
+    private fun sendBleReport(char: BluetoothGattCharacteristic?, data: ByteArray, trackBusy: Boolean = true) {
         val host = connectedHost ?: return
         val server = gattServer ?: return
         val c = char ?: return
         try {
+            if (trackBusy) {
+                isBleBusy = true
+                lastSendTime = System.currentTimeMillis()
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 server.notifyCharacteristicChanged(host, c, false, data)
             } else {
                 c.value = data
                 server.notifyCharacteristicChanged(host, c, false)
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            isBleBusy = false
+        }
     }
 
     private fun handleMouseEvent(event: MotionEvent) {
-        var buttons = 0
-        if (event.buttonState and MotionEvent.BUTTON_PRIMARY != 0) buttons = buttons or 0x01
-        if (event.buttonState and MotionEvent.BUTTON_SECONDARY != 0) buttons = buttons or 0x02
-        if (event.buttonState and MotionEvent.BUTTON_TERTIARY != 0) buttons = buttons or 0x04
+        var buttonChanged = false
+        synchronized(mouseLock) {
+            var buttons = 0
+            if (event.buttonState and MotionEvent.BUTTON_PRIMARY != 0) buttons = buttons or 0x01
+            if (event.buttonState and MotionEvent.BUTTON_SECONDARY != 0) buttons = buttons or 0x02
+            if (event.buttonState and MotionEvent.BUTTON_TERTIARY != 0) buttons = buttons or 0x04
+            if (buttons != currentButtons) {
+                currentButtons = buttons
+                buttonChanged = true
+            }
 
-        val dx = if (event.actionMasked == MotionEvent.ACTION_MOVE || event.actionMasked == MotionEvent.ACTION_HOVER_MOVE)
-            event.x.toInt().coerceIn(-127, 127) else 0
-        val dy = if (event.actionMasked == MotionEvent.ACTION_MOVE || event.actionMasked == MotionEvent.ACTION_HOVER_MOVE)
-            event.y.toInt().coerceIn(-127, 127) else 0
-        val wheel = if (event.actionMasked == MotionEvent.ACTION_SCROLL)
-            event.getAxisValue(MotionEvent.AXIS_VSCROLL).toInt().coerceIn(-127, 127) else 0
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> {
+                    for (i in 0 until event.historySize) {
+                        accDx += event.getHistoricalX(i) * sensitivity
+                        accDy += event.getHistoricalY(i) * sensitivity
+                    }
+                    accDx += event.x * sensitivity
+                    accDy += event.y * sensitivity
+                }
+                MotionEvent.ACTION_SCROLL -> {
+                    accWheel += event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+                }
+            }
+        }
+        if (buttonChanged) flushMouseReport()
+    }
 
-        val report = byteArrayOf(buttons.toByte(), dx.toByte(), dy.toByte(), wheel.toByte())
-        sendBleReport(mouseReportChar, report)
+    private fun flushMouseReport() {
+        if (!isCapturing || connectedHost == null) return
+        val now = System.currentTimeMillis()
+        if (isBleBusy && (now - lastSendTime) < 50L) return
+
+        val report: ByteArray
+        synchronized(mouseLock) {
+            val dx = accDx.toInt().coerceIn(-127, 127)
+            val dy = accDy.toInt().coerceIn(-127, 127)
+            val wheel = accWheel.toInt().coerceIn(-127, 127)
+            val btn = currentButtons
+            val btnChanged = btn != lastSentButtons
+
+            if (dx == 0 && dy == 0 && wheel == 0 && !btnChanged) return
+
+            accDx -= dx
+            accDy -= dy
+            accWheel -= wheel
+            lastSentButtons = btn
+            report = byteArrayOf(btn.toByte(), dx.toByte(), dy.toByte(), wheel.toByte())
+        }
+        sendBleReport(mouseReportChar, report, trackBusy = true)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -508,7 +679,7 @@ class MainActivity : Activity() {
         for (k in pressedKeys) {
             if (i < 8) report[i++] = k
         }
-        sendBleReport(keyboardReportChar, report)
+        sendBleReport(keyboardReportChar, report, trackBusy = false)
     }
 
     private val keyMap = mapOf(
