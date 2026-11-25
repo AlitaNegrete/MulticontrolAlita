@@ -152,7 +152,7 @@ class MainActivity : Activity() {
 
     private fun log(msg: String) {
         runOnUiThread {
-            logText.append("• $msg\n")
+            logText.append("• \$msg\n")
             logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
         }
     }
@@ -164,7 +164,7 @@ class MainActivity : Activity() {
             val host = hostDevice
             when {
                 host != null -> {
-                    statusView.text = "● Conectado con ${nameOf(host)}"
+                    statusView.text = "● Conectado con \${nameOf(host)}"
                     statusView.setTextColor(Color.parseColor("#4CAF50"))
                 }
                 isRegistered -> {
@@ -258,18 +258,18 @@ class MainActivity : Activity() {
             if (registered) connectToLast(silent = true)
         }
 
-        override fun onConnectionStateChange(device: BluetoothDevice?, state: Int) {
+        override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
             when (state) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     hostDevice = device
                     device?.let {
                         getSharedPreferences("mc", MODE_PRIVATE).edit().putString("host", it.address).apply()
                     }
-                    log("CONECTADO con ${nameOf(device)}")
+                    log("CONECTADO con \${nameOf(device)}")
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     if (hostDevice?.address == device?.address) hostDevice = null
-                    log("DESCONECTADO de ${nameOf(device)}")
+                    log("DESCONECTADO de \${nameOf(device)}")
                     if (isCapturing) runOnUiThread { releaseCapture() }
                 }
             }
@@ -300,7 +300,7 @@ class MainActivity : Activity() {
             return false
         }
         if (hostDevice?.address == dev.address) return true
-        log("Conectando con ${nameOf(dev)}...")
+        log("Conectando con \${nameOf(dev)}...")
         return hid.connect(dev)
     }
 
@@ -327,7 +327,7 @@ class MainActivity : Activity() {
             .setItems(devices.map { nameOf(it) }.toTypedArray()) { _, i ->
                 val dev = devices[i]
                 getSharedPreferences("mc", MODE_PRIVATE).edit().putString("host", dev.address).apply()
-                log("Conectando con ${nameOf(dev)}...")
+                log("Conectando con \${nameOf(dev)}...")
                 hidDevice?.connect(dev)
             }
             .show()
@@ -394,93 +394,4 @@ class MainActivity : Activity() {
 
         // Si el movimiento es mayor a lo que cabe en un reporte, se envía en partes
         do {
-            val cx = dx.coerceIn(-127, 127)
-            val cy = dy.coerceIn(-127, 127)
-            sendReport(2, byteArrayOf(buttons.toByte(), cx.toByte(), cy.toByte(), wheel.toByte()))
-            dx -= cx
-            dy -= cy
-            wheel = 0
-        } while (dx != 0 || dy != 0)
-    }
-
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val isToggle = event.action == KeyEvent.ACTION_DOWN &&
-            event.keyCode == KeyEvent.KEYCODE_SPACE &&
-            event.isCtrlPressed && event.isShiftPressed
-
-        if (!isCapturing) {
-            if (isToggle) {
-                startCapture()
-                return true
-            }
-            return super.dispatchKeyEvent(event)
-        }
-
-        if (isToggle) {
-            releaseCapture()
-            return true
-        }
-
-        val hidCode = keyMap[event.keyCode]
-        if (hidCode != null) {
-            if (event.action == KeyEvent.ACTION_DOWN) {
-                if (pressedKeys.size < 6) pressedKeys.add(hidCode)
-            } else if (event.action == KeyEvent.ACTION_UP) {
-                pressedKeys.remove(hidCode)
-            }
-        }
-
-        var mod = 0
-        if (event.isCtrlPressed) mod = mod or 0x01
-        if (event.isShiftPressed) mod = mod or 0x02
-        if (event.isAltPressed) mod = mod or 0x04
-        if (event.isMetaPressed) mod = mod or 0x08
-
-        val report = ByteArray(8)
-        report[0] = mod.toByte()
-        var i = 2
-        for (k in pressedKeys) {
-            if (i < 8) report[i++] = k
-        }
-        sendReport(1, report)
-        return true
-    }
-
-    private val keyMap: Map<Int, Byte> = buildMap {
-        // Letras A-Z -> 0x04..0x1D
-        for (i in 0 until 26) put(KeyEvent.KEYCODE_A + i, (0x04 + i).toByte())
-        // Números 1-9 -> 0x1E..0x26, 0 -> 0x27
-        for (i in 0 until 9) put(KeyEvent.KEYCODE_1 + i, (0x1E + i).toByte())
-        put(KeyEvent.KEYCODE_0, 0x27.toByte())
-        // Teclas de función F1-F12 -> 0x3A..0x45
-        for (i in 0 until 12) put(KeyEvent.KEYCODE_F1 + i, (0x3A + i).toByte())
-
-        put(KeyEvent.KEYCODE_ENTER, 0x28.toByte())
-        put(KeyEvent.KEYCODE_ESCAPE, 0x29.toByte())
-        put(KeyEvent.KEYCODE_DEL, 0x2A.toByte())
-        put(KeyEvent.KEYCODE_TAB, 0x2B.toByte())
-        put(KeyEvent.KEYCODE_SPACE, 0x2C.toByte())
-        put(KeyEvent.KEYCODE_MINUS, 0x2D.toByte())
-        put(KeyEvent.KEYCODE_EQUALS, 0x2E.toByte())
-        put(KeyEvent.KEYCODE_LEFT_BRACKET, 0x2F.toByte())
-        put(KeyEvent.KEYCODE_RIGHT_BRACKET, 0x30.toByte())
-        put(KeyEvent.KEYCODE_BACKSLASH, 0x31.toByte())
-        put(KeyEvent.KEYCODE_SEMICOLON, 0x33.toByte())
-        put(KeyEvent.KEYCODE_APOSTROPHE, 0x34.toByte())
-        put(KeyEvent.KEYCODE_GRAVE, 0x35.toByte())
-        put(KeyEvent.KEYCODE_COMMA, 0x36.toByte())
-        put(KeyEvent.KEYCODE_PERIOD, 0x37.toByte())
-        put(KeyEvent.KEYCODE_SLASH, 0x38.toByte())
-        put(KeyEvent.KEYCODE_CAPS_LOCK, 0x39.toByte())
-        put(KeyEvent.KEYCODE_INSERT, 0x49.toByte())
-        put(KeyEvent.KEYCODE_MOVE_HOME, 0x4A.toByte())
-        put(KeyEvent.KEYCODE_PAGE_UP, 0x4B.toByte())
-        put(KeyEvent.KEYCODE_FORWARD_DEL, 0x4C.toByte())
-        put(KeyEvent.KEYCODE_MOVE_END, 0x4D.toByte())
-        put(KeyEvent.KEYCODE_PAGE_DOWN, 0x4E.toByte())
-        put(KeyEvent.KEYCODE_DPAD_RIGHT, 0x4F.toByte())
-        put(KeyEvent.KEYCODE_DPAD_LEFT, 0x50.toByte())
-        put(KeyEvent.KEYCODE_DPAD_DOWN, 0x51.toByte())
-        put(KeyEvent.KEYCODE_DPAD_UP, 0x52.toByte())
-    }
-}
+            val cx = dx.coerceIn(-1
