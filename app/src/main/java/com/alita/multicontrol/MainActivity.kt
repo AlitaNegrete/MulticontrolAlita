@@ -3,374 +3,151 @@ package com.alita.multicontrol
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.bluetooth.*
-import android.bluetooth.le.AdvertiseCallback
-import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
-import android.bluetooth.le.BluetoothLeAdvertiser
-import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.ParcelUuid
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
-import android.view.Window
 import android.widget.*
-import java.util.ArrayDeque
-import java.util.UUID
+import java.util.concurrent.Executors
 
+// Versión 1: Bluetooth HID clásico (BluetoothHidDevice) en vez de BLE.
+// La Tab S6 se presenta ante la Y700 como teclado + mouse.
+@SuppressLint("MissingPermission")
 class MainActivity : Activity() {
 
-    private var btManager: BluetoothManager? = null
     private var btAdapter: BluetoothAdapter? = null
-    private var gattServer: BluetoothGattServer? = null
-    private var advertiser: BluetoothLeAdvertiser? = null
-    private var connectedHost: BluetoothDevice? = null
+    private var hidDevice: BluetoothHidDevice? = null
+    @Volatile private var hostDevice: BluetoothDevice? = null
+    @Volatile private var isRegistered = false
+    private var isCapturing = false
 
-    private var keyboardReportChar: BluetoothGattCharacteristic? = null
-    private var mouseReportChar: BluetoothGattCharacteristic? = null
-    private var protocolMode = byteArrayOf(0x01)
-    private val serviceQueue = ArrayDeque<BluetoothGattService>()
+    private val executor = Executors.newSingleThreadExecutor()
+    private val pressedKeys = LinkedHashSet<Byte>()
+    private var remX = 0f
+    private var remY = 0f
+    private var lastButtons = 0
 
-    private lateinit var statusDot: View
-    private lateinit var statusText: TextView
-    private lateinit var btnBle: TextView
-    private lateinit var speedLabel: TextView
+    // Sensibilidad del mouse (1.0 = normal). Si va muy rápido, bájala (0.7); si va lento, súbela.
+    private val sensitivity = 1.0f
+
+    private lateinit var statusView: TextView
     private lateinit var captureZone: TextView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
-    private lateinit var helpScroll: ScrollView
 
-    private var isCapturing = false
-    private var isAdvertising = false
-    private val pressedKeys = LinkedHashSet<Byte>()
-
-    private val mouseLock = Any()
-    private var accDx = 0f
-    private var accDy = 0f
-    private var accWheel = 0f
-    private var currentButtons = 0
-    private var lastSentButtons = 0
-    private var sensitivity = 1.0f
-    @Volatile private var isBleBusy = false
-    @Volatile private var lastSendTime = 0L
-
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val mouseTicker = object : Runnable {
-        override fun run() {
-            flushMouseReport()
-            mainHandler.postDelayed(this, 14L)
-        }
-    }
-
-    // Servicios estándar HOGP (HID sobre BLE)
-    private val UUID_DIS_SERVICE = UUID.fromString("0000180a-0000-1000-8000-00805f9b34fb")
-    private val UUID_PNP_ID = UUID.fromString("00002a50-0000-1000-8000-00805f9b34fb")
-    private val UUID_BAT_SERVICE = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
-    private val UUID_BAT_LEVEL = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
-
-    private val UUID_HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb")
-    private val UUID_HID_INFO = UUID.fromString("00002a4a-0000-1000-8000-00805f9b34fb")
-    private val UUID_REPORT_MAP = UUID.fromString("00002a4b-0000-1000-8000-00805f9b34fb")
-    private val UUID_CONTROL_POINT = UUID.fromString("00002a4c-0000-1000-8000-00805f9b34fb")
-    private val UUID_REPORT = UUID.fromString("00002a4d-0000-1000-8000-00805f9b34fb")
-    private val UUID_PROTOCOL_MODE = UUID.fromString("00002a4e-0000-1000-8000-00805f9b34fb")
-    private val UUID_CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-    private val UUID_REPORT_REF = UUID.fromString("00002908-0000-1000-8000-00805f9b34fb")
-
-    private val hidDescriptor = byteArrayOf(
-        // === Teclado (Report ID 1) ===
-        0x05.toByte(), 0x01.toByte(),
-        0x09.toByte(), 0x06.toByte(),
-        0xA1.toByte(), 0x01.toByte(),
-        0x85.toByte(), 0x01.toByte(),
-        0x05.toByte(), 0x07.toByte(),
-        0x19.toByte(), 0xE0.toByte(),
-        0x29.toByte(), 0xE7.toByte(),
-        0x15.toByte(), 0x00.toByte(),
-        0x25.toByte(), 0x01.toByte(),
-        0x75.toByte(), 0x01.toByte(),
-        0x95.toByte(), 0x08.toByte(),
-        0x81.toByte(), 0x02.toByte(),
-        0x95.toByte(), 0x01.toByte(),
-        0x75.toByte(), 0x08.toByte(),
-        0x81.toByte(), 0x01.toByte(),
-        0x95.toByte(), 0x06.toByte(),
-        0x75.toByte(), 0x08.toByte(),
-        0x15.toByte(), 0x00.toByte(),
-        0x25.toByte(), 0x65.toByte(),
-        0x05.toByte(), 0x07.toByte(),
-        0x19.toByte(), 0x00.toByte(),
-        0x29.toByte(), 0x65.toByte(),
-        0x81.toByte(), 0x00.toByte(),
-        0xC0.toByte(),
-        // === Mouse (Report ID 2) ===
-        0x05.toByte(), 0x01.toByte(),
-        0x09.toByte(), 0x02.toByte(),
-        0xA1.toByte(), 0x01.toByte(),
-        0x85.toByte(), 0x02.toByte(),
-        0x09.toByte(), 0x01.toByte(),
-        0xA1.toByte(), 0x00.toByte(),
-        0x05.toByte(), 0x09.toByte(),
-        0x19.toByte(), 0x01.toByte(),
-        0x29.toByte(), 0x03.toByte(),
-        0x15.toByte(), 0x00.toByte(),
-        0x25.toByte(), 0x01.toByte(),
-        0x95.toByte(), 0x03.toByte(),
-        0x75.toByte(), 0x01.toByte(),
-        0x81.toByte(), 0x02.toByte(),
-        0x95.toByte(), 0x01.toByte(),
-        0x75.toByte(), 0x05.toByte(),
-        0x81.toByte(), 0x01.toByte(),
-        0x05.toByte(), 0x01.toByte(),
-        0x09.toByte(), 0x30.toByte(),
-        0x09.toByte(), 0x31.toByte(),
-        0x09.toByte(), 0x38.toByte(),
-        0x15.toByte(), 0x81.toByte(),
-        0x25.toByte(), 0x7F.toByte(),
-        0x75.toByte(), 0x08.toByte(),
-        0x95.toByte(), 0x03.toByte(),
-        0x81.toByte(), 0x06.toByte(),
-        0xC0.toByte(),
-        0xC0.toByte()
-    )
+    // Descriptor HID: Report ID 1 = teclado (8 bytes), Report ID 2 = mouse (4 bytes)
+    private val hidDescriptor = intArrayOf(
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
+        0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08,
+        0x81, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00,
+        0x29, 0x65, 0x81, 0x00, 0xC0,
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09,
+        0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0xC0, 0xC0
+    ).map { it.toByte() }.toByteArray()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestWindowFeature(Window.FEATURE_NO_TITLE)
-        btManager = getSystemService(BluetoothManager::class.java)
-        btAdapter = btManager?.adapter
+        btAdapter = getSystemService(BluetoothManager::class.java)?.adapter
         buildUi()
-        checkAndRequestPermissions()
-        mainHandler.post(mouseTicker)
+        if (hasBtPermissions()) {
+            initHid()
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 100)
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        mainHandler.removeCallbacks(mouseTicker)
-        stopBleHid()
+        try {
+            hidDevice?.unregisterApp()
+            btAdapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hidDevice)
+        } catch (_: Exception) {}
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
-    private fun roundedBg(fillHex: String, radiusDp: Int, strokeHex: String? = null): GradientDrawable {
-        return GradientDrawable().apply {
-            setColor(Color.parseColor(fillHex))
-            cornerRadius = dp(radiusDp).toFloat()
-            if (strokeHex != null) setStroke(dp(1), Color.parseColor(strokeHex))
-        }
-    }
-
-    private fun makePillButton(label: String, fillHex: String = "#232736", onClick: () -> Unit): TextView {
-        return TextView(this).apply {
-            text = label
-            textSize = 12f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#E5E7EB"))
-            gravity = Gravity.CENTER
-            background = roundedBg(fillHex, 10, "#343B52")
-            setPadding(dp(9), dp(6), dp(9), dp(6))
-            isClickable = true
-            setOnClickListener { onClick() }
-        }
-    }
+    // ---------- Interfaz ----------
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0F1117"))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(Color.parseColor("#121212"))
+            setPadding(32, 32, 32, 32)
         }
 
-        val topBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        statusDot = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(10), dp(10)).apply { rightMargin = dp(8) }
-            background = roundedBg("#6B7280", 10)
-        }
-        topBar.addView(statusDot)
-
-        statusText = TextView(this).apply {
-            text = "Iniciando..."
-            textSize = 13f
+        root.addView(TextView(this).apply {
+            text = "Multicontrol Alita"
+            textSize = 20f
             setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#E5E7EB"))
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            maxLines = 1
-        }
-        topBar.addView(statusText)
+            setTextColor(Color.WHITE)
+        })
 
-        val btnMinus = makePillButton("−") { adjustSpeed(-0.2f) }.apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                rightMargin = dp(3)
-            }
+        statusView = TextView(this).apply {
+            textSize = 16f
+            setPadding(0, 12, 0, 12)
         }
-        speedLabel = TextView(this).apply {
-            text = String.format("%.1fx", sensitivity)
-            textSize = 12f
-            setTextColor(Color.parseColor("#C4B5FD"))
-            setPadding(dp(3), 0, dp(3), 0)
-        }
-        val btnPlus = makePillButton("+") { adjustSpeed(0.2f) }.apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                leftMargin = dp(3)
-                rightMargin = dp(5)
-            }
-        }
+        root.addView(statusView)
 
-        val btnReconn = makePillButton("↺", "#1E3A4C") {
-            if (!isAdvertising) startBleHid() else tryReconnectLastHost(manual = true)
-        }.apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                rightMargin = dp(4)
-            }
-        }
-
-        btnBle = makePillButton("BLE", "#2D254C") {
-            if (isAdvertising) stopBleHid() else startBleHid()
-        }.apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                rightMargin = dp(4)
-            }
-        }
-
-        val btnLog = makePillButton("Log") {
-            helpScroll.visibility = View.GONE
-            logScroll.visibility = if (logScroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        }.apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                rightMargin = dp(4)
-            }
-        }
-
-        val btnHelp = makePillButton("?", "#1F3A5F") {
-            logScroll.visibility = View.GONE
-            helpScroll.visibility = if (helpScroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        }
-
-        topBar.addView(btnMinus)
-        topBar.addView(speedLabel)
-        topBar.addView(btnPlus)
-        topBar.addView(btnReconn)
-        topBar.addView(btnBle)
-        topBar.addView(btnLog)
-        topBar.addView(btnHelp)
-        root.addView(topBar)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(makeButton("Conectar") { connectToLastOrAsk() })
+        row.addView(makeButton("Elegir tablet") { pickHost() })
+        row.addView(makeButton("Reiniciar") { restartHid() })
+        root.addView(row)
 
         captureZone = TextView(this).apply {
-            text = "CONTROLAR Y700\nEsperando conexión BLE..."
-            textSize = 14f
-            setTypeface(null, Typeface.BOLD)
+            textSize = 16f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
-            background = roundedBg("#243056", 14, "#4C63A6")
-            setPadding(dp(16), dp(18), dp(16), dp(18))
+            setPadding(24, 48, 24, 48)
             isFocusable = true
             isFocusableInTouchMode = true
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(10) }
-            setOnClickListener {
-                if (isCapturing) releaseCapture() else startCapture()
-            }
+            ).apply { topMargin = 20 }
+            setOnClickListener { if (isCapturing) releaseCapture() else startCapture() }
             setOnCapturedPointerListener { _, event ->
                 handleMouseEvent(event)
                 true
             }
         }
         root.addView(captureZone)
+        showCaptureText(false)
 
         logText = TextView(this).apply {
-            textSize = 11f
+            textSize = 12f
             typeface = Typeface.MONOSPACE
-            setTextColor(Color.parseColor("#A7F3D0"))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setTextColor(Color.parseColor("#A8E6CF"))
+            setPadding(16, 16, 16, 16)
         }
         logScroll = ScrollView(this).apply {
-            background = roundedBg("#161923", 10, "#262B3D")
-            visibility = View.GONE
+            setBackgroundColor(Color.parseColor("#1E1E1E"))
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(130)
-            ).apply { topMargin = dp(10) }
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            ).apply { topMargin = 20 }
             addView(logText)
         }
         root.addView(logScroll)
 
-        val helpText = TextView(this).apply {
-            textSize = 12f
-            setTextColor(Color.parseColor("#E5E7EB"))
-            setLineSpacing(dp(2).toFloat(), 1.0f)
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            text = """
-                USO DIARIO / AL VOLVER DE UN BREAK
-                1. Deja esta app abierta en BLE ON.
-                2. Toca ↺ para buscar la Y700, o toca esta tablet en el Bluetooth de la Y700.
-                3. Cuando el punto esté verde, toca el botón azul. Salir: Ctrl + Shift + Espacio.
-
-                PRIMER EMPAREJAMIENTO (CLAVE)
-                1. Olvida el vínculo anterior en AMBAS tablets (y NO abras Ajustes BT en la Tab S6).
-                2. Abre esta app (BLE ON) y busca desde la Y700.
-                3. Elige el ícono de BLUETOOTH (nunca el de llamada/celular) y acepta vincular.
-            """.trimIndent()
-        }
-        helpScroll = ScrollView(this).apply {
-            background = roundedBg("#161D2F", 10, "#3B5284")
-            visibility = View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(155)
-            ).apply { topMargin = dp(10) }
-            addView(helpText)
-        }
-        root.addView(helpScroll)
-
         setContentView(root)
+        updateStatus()
     }
 
-    private fun adjustSpeed(delta: Float) {
-        sensitivity = (sensitivity + delta).coerceIn(0.4f, 4.0f)
-        speedLabel.text = String.format("%.1fx", sensitivity)
-        log("Velocidad mouse: ${speedLabel.text}")
-    }
-
-    private fun updateCaptureZoneUi() {
-        runOnUiThread {
-            when {
-                isCapturing -> {
-                    captureZone.background = roundedBg("#116B52", 14, "#34D399")
-                    captureZone.text = "CONTROLANDO Y700\nSalir: Ctrl + Shift + Espacio (o toca aquí)"
-                }
-                connectedHost != null -> {
-                    captureZone.background = roundedBg("#243056", 14, "#4C63A6")
-                    captureZone.text = "CONTROLAR Y700\nClic aquí  •  Salir: Ctrl + Shift + Espacio"
-                }
-                else -> {
-                    captureZone.background = roundedBg("#1E2230", 14, "#374151")
-                    captureZone.text = "SIN CONEXIÓN\nToca ↺ o conecta desde la Y700"
-                }
-            }
+    private fun makeButton(label: String, action: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { action() }
         }
-    }
-
-    private fun updateStatus(text: String, dotHex: String) {
-        runOnUiThread {
-            statusText.text = text
-            statusDot.background = roundedBg(dotHex, 10)
-            btnBle.text = if (isAdvertising) "BLE ON" else "BLE OFF"
-            btnBle.background = roundedBg(if (isAdvertising) "#3B2866" else "#232736", 10, "#5B4499")
-        }
-        updateCaptureZoneUi()
     }
 
     private fun log(msg: String) {
@@ -380,449 +157,266 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun saveLastHost(address: String) {
-        getSharedPreferences("multicontrol_prefs", Context.MODE_PRIVATE)
-            .edit().putString("last_host_addr", address).apply()
+    private fun nameOf(d: BluetoothDevice?): String = d?.name ?: d?.address ?: "?"
+
+    private fun updateStatus() {
+        runOnUiThread {
+            val host = hostDevice
+            when {
+                host != null -> {
+                    statusView.text = "● Conectado con ${nameOf(host)}"
+                    statusView.setTextColor(Color.parseColor("#4CAF50"))
+                }
+                isRegistered -> {
+                    statusView.text = "● Listo. Toca Conectar para enlazar la Y700"
+                    statusView.setTextColor(Color.parseColor("#FFC107"))
+                }
+                else -> {
+                    statusView.text = "● Bluetooth HID inactivo (toca Reiniciar)"
+                    statusView.setTextColor(Color.parseColor("#9E9E9E"))
+                }
+            }
+        }
     }
 
-    private fun getLastHostAddress(): String? {
-        return getSharedPreferences("multicontrol_prefs", Context.MODE_PRIVATE)
-            .getString("last_host_addr", null)
+    private fun showCaptureText(active: Boolean) {
+        if (active) {
+            captureZone.setBackgroundColor(Color.parseColor("#1E6F50"))
+            captureZone.text = "CONTROLANDO LA OTRA TABLET\n(Ctrl + Shift + Espacio o toca aquí para volver)"
+        } else {
+            captureZone.setBackgroundColor(Color.parseColor("#1F3A5F"))
+            captureZone.text = "TOCA AQUÍ PARA CONTROLAR LA OTRA TABLET\n(Para volver: Ctrl + Shift + Espacio o toca aquí)"
+        }
     }
+
+    // ---------- Permisos y arranque del HID ----------
 
     private fun hasBtPermissions(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
-                checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
         } else true
-    }
-
-    private fun checkAndRequestPermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !hasBtPermissions()) {
-            requestPermissions(
-                arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE),
-                100
-            )
-        } else {
-            startBleHid()
-        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (hasBtPermissions()) {
-            startBleHid()
-        } else {
-            updateStatus("Sin permiso BT", "#EF4444")
-            log("ERROR: Faltan permisos de Dispositivos Cercanos.")
-        }
+        if (hasBtPermissions()) initHid() else log("Faltan permisos de Dispositivos cercanos (Bluetooth).")
     }
 
-    @SuppressLint("MissingPermission")
-    private fun startBleHid() {
-        if (!hasBtPermissions()) return
-        if (gattServer != null) return
-
-        val server = btManager?.openGattServer(this, gattCallback)
-        if (server == null) {
-            updateStatus("Error GATT", "#EF4444")
-            log("ERROR: No se pudo abrir el servidor GATT BLE.")
+    private fun initHid() {
+        val adapter = btAdapter
+        if (adapter == null || !adapter.isEnabled) {
+            log("Bluetooth apagado o no disponible. Enciéndelo y toca Reiniciar.")
             return
         }
-        gattServer = server
-        serviceQueue.clear()
-
-        // 1. Device Information Service (PnP ID)
-        val disService = BluetoothGattService(UUID_DIS_SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY).apply {
-            addCharacteristic(
-                BluetoothGattCharacteristic(
-                    UUID_PNP_ID,
-                    BluetoothGattCharacteristic.PROPERTY_READ,
-                    BluetoothGattCharacteristic.PERMISSION_READ
-                )
-            )
-        }
-
-        // 2. Battery Service
-        val batService = BluetoothGattService(UUID_BAT_SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY).apply {
-            addCharacteristic(
-                BluetoothGattCharacteristic(
-                    UUID_BAT_LEVEL,
-                    BluetoothGattCharacteristic.PROPERTY_READ,
-                    BluetoothGattCharacteristic.PERMISSION_READ
-                )
-            )
-        }
-
-        // 3. HID Service con cifrado obligatorio para guardar llave BLE permanente
-        val hidService = BluetoothGattService(UUID_HID_SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-
-        val hidInfo = BluetoothGattCharacteristic(
-            UUID_HID_INFO,
-            BluetoothGattCharacteristic.PROPERTY_READ,
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
-        )
-        val reportMap = BluetoothGattCharacteristic(
-            UUID_REPORT_MAP,
-            BluetoothGattCharacteristic.PROPERTY_READ,
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
-        )
-        val controlPoint = BluetoothGattCharacteristic(
-            UUID_CONTROL_POINT,
-            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
-            BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED
-        )
-        val protoMode = BluetoothGattCharacteristic(
-            UUID_PROTOCOL_MODE,
-            BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED or BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED
-        )
-
-        keyboardReportChar = BluetoothGattCharacteristic(
-            UUID_REPORT,
-            BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
-        ).apply {
-            addDescriptor(
-                BluetoothGattDescriptor(
-                    UUID_CCCD,
-                    BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
-                )
-            )
-            addDescriptor(
-                BluetoothGattDescriptor(UUID_REPORT_REF, BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED)
-            )
-        }
-
-        mouseReportChar = BluetoothGattCharacteristic(
-            UUID_REPORT,
-            BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
-        ).apply {
-            addDescriptor(
-                BluetoothGattDescriptor(
-                    UUID_CCCD,
-                    BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
-                )
-            )
-            addDescriptor(
-                BluetoothGattDescriptor(UUID_REPORT_REF, BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED)
-            )
-        }
-
-        hidService.addCharacteristic(hidInfo)
-        hidService.addCharacteristic(reportMap)
-        hidService.addCharacteristic(controlPoint)
-        hidService.addCharacteristic(protoMode)
-        hidService.addCharacteristic(keyboardReportChar)
-        hidService.addCharacteristic(mouseReportChar)
-
-        serviceQueue.add(disService)
-        serviceQueue.add(batService)
-        serviceQueue.add(hidService)
-
-        updateStatus("Cargando HID...", "#F59E0B")
-        addNextServiceOrAdvertise()
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun addNextServiceOrAdvertise() {
-        val server = gattServer ?: return
-        val next = serviceQueue.poll()
-        if (next != null) {
-            server.addService(next)
-        } else {
-            startAdvertisingNow()
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun startAdvertisingNow() {
-        advertiser = btAdapter?.bluetoothLeAdvertiser
-        if (advertiser == null) {
-            updateStatus("Sin soporte BLE", "#EF4444")
-            return
-        }
-
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setConnectable(true)
-            .build()
-
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .addServiceUuid(ParcelUuid(UUID_HID_SERVICE))
-            .build()
-
-        val scanResponse = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .build()
-
-        advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun tryReconnectLastHost(manual: Boolean = false) {
-        if (!hasBtPermissions() || gattServer == null) return
-        val addr = getLastHostAddress()
-        if (addr == null) {
-            if (manual) log("Aún no hay Y700 guardada. Vincula desde la Y700 primero.")
-            return
-        }
-        try {
-            val bonded = btAdapter?.bondedDevices?.firstOrNull { it.address == addr }
-            if (bonded != null) {
-                gattServer?.connect(bonded, true)
-                log("Buscando reconexión con ${bonded.name ?: addr}...")
-            } else if (manual) {
-                log("La Y700 no figura vinculada en BLE. Conecta desde la Y700.")
-            }
-        } catch (e: Exception) {
-            if (manual) log("No se pudo iniciar reconexión: ${e.message}")
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun stopBleHid() {
-        try {
-            if (isCapturing) releaseCapture()
-            if (isAdvertising) advertiser?.stopAdvertising(advertiseCallback)
-            gattServer?.close()
-        } catch (_: Exception) {}
-        serviceQueue.clear()
-        isAdvertising = false
-        gattServer = null
-        connectedHost = null
-        isBleBusy = false
-        updateStatus("BLE detenido", "#6B7280")
-        log("Señal BLE detenida.")
-    }
-
-    private val advertiseCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-            isAdvertising = true
-            updateStatus("Listo (esperando Y700)", "#F59E0B")
-            log("Servicios HOGP listos. Señal BLE activa.")
-            tryReconnectLastHost(manual = false)
-        }
-
-        override fun onStartFailure(errorCode: Int) {
-            isAdvertising = false
-            updateStatus("Error BLE ($errorCode)", "#EF4444")
-            log("ERROR al emitir señal BLE (código $errorCode).")
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private val gattCallback = object : BluetoothGattServerCallback() {
-        override fun onServiceAdded(status: Int, service: BluetoothGattService) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                log("Aviso al cargar servicio ${service.uuid}: $status")
-            }
-            mainHandler.post { addNextServiceOrAdvertise() }
-        }
-
-        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                connectedHost = device
-                isBleBusy = false
-                saveLastHost(device.address)
-                val name = device.name ?: "Y700"
-                updateStatus("Conectado: $name", "#10B981")
-                log("Conectado con $name")
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                if (connectedHost?.address == device.address) connectedHost = null
-                isBleBusy = false
-                runOnUiThread {
-                    if (isCapturing) releaseCapture()
+        adapter.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                if (profile == BluetoothProfile.HID_DEVICE) {
+                    hidDevice = proxy as BluetoothHidDevice
+                    registerHid()
                 }
-                updateStatus(if (isAdvertising) "Listo (esperando Y700)" else "Desconectado", "#F59E0B")
-                log("Desconectado de ${device.name ?: device.address}")
             }
-        }
 
-        override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
-            isBleBusy = false
-        }
-
-        override fun onCharacteristicReadRequest(
-            device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic
-        ) {
-            val fullData = when (characteristic.uuid) {
-                UUID_PNP_ID -> byteArrayOf(0x02, 0x05, 0x05, 0x01, 0x00, 0x01, 0x00)
-                UUID_BAT_LEVEL -> byteArrayOf(100.toByte())
-                UUID_HID_INFO -> byteArrayOf(0x11, 0x01, 0x00, 0x02)
-                UUID_REPORT_MAP -> hidDescriptor
-                UUID_PROTOCOL_MODE -> protocolMode
-                UUID_REPORT -> if (characteristic === keyboardReportChar) ByteArray(8) else ByteArray(4)
-                else -> ByteArray(0)
-            }
-            val slice = if (offset >= fullData.size) ByteArray(0) else fullData.copyOfRange(offset, fullData.size)
-            gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
-        }
-
-        override fun onCharacteristicWriteRequest(
-            device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic,
-            preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?
-        ) {
-            if (characteristic.uuid == UUID_PROTOCOL_MODE && value != null && value.isNotEmpty()) {
-                protocolMode = value
-            }
-            if (responseNeeded) {
-                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
-            }
-        }
-
-        override fun onDescriptorReadRequest(
-            device: BluetoothDevice, requestId: Int, offset: Int, descriptor: BluetoothGattDescriptor
-        ) {
-            val data = when (descriptor.uuid) {
-                UUID_REPORT_REF -> {
-                    if (descriptor.characteristic === keyboardReportChar) byteArrayOf(0x01, 0x01)
-                    else byteArrayOf(0x02, 0x01)
+            override fun onServiceDisconnected(profile: Int) {
+                if (profile == BluetoothProfile.HID_DEVICE) {
+                    hidDevice = null
+                    isRegistered = false
+                    hostDevice = null
+                    updateStatus()
                 }
-                UUID_CCCD -> BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                else -> ByteArray(0)
             }
-            val slice = if (offset >= data.size) ByteArray(0) else data.copyOfRange(offset, data.size)
-            gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
-        }
+        }, BluetoothProfile.HID_DEVICE)
+    }
 
-        override fun onDescriptorWriteRequest(
-            device: BluetoothDevice, requestId: Int, descriptor: BluetoothGattDescriptor,
-            preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?
-        ) {
-            if (responseNeeded) {
-                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
-            }
-            if (descriptor.uuid == UUID_CCCD) {
-                log("Canal HID listo.")
-            }
+    private fun registerHid() {
+        val hid = hidDevice ?: return
+        val sdp = BluetoothHidDeviceAppSdpSettings(
+            "MulticontrolAlita", "Teclado y mouse", "Alita",
+            BluetoothHidDevice.SUBCLASS1_COMBO, hidDescriptor
+        )
+        val ok = hid.registerApp(sdp, null, null, executor, hidCallback)
+        if (!ok) {
+            log("No se pudo registrar. Cierra otras apps de teclado/mouse Bluetooth y toca Reiniciar.")
         }
     }
+
+    private fun restartHid() {
+        log("Reiniciando enlace...")
+        try { hidDevice?.unregisterApp() } catch (_: Exception) {}
+        isRegistered = false
+        hostDevice = null
+        updateStatus()
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (hidDevice != null) registerHid() else initHid()
+        }, 600)
+    }
+
+    private val hidCallback = object : BluetoothHidDevice.Callback() {
+        override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+            isRegistered = registered
+            log(if (registered) "HID activo." else "HID desactivado.")
+            updateStatus()
+            if (registered) connectToLast(silent = true)
+        }
+
+        override fun onConnectionStateChange(device: BluetoothDevice?, state: Int) {
+            when (state) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    hostDevice = device
+                    device?.let {
+                        getSharedPreferences("mc", MODE_PRIVATE).edit().putString("host", it.address).apply()
+                    }
+                    log("CONECTADO con ${nameOf(device)}")
+                }
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    if (hostDevice?.address == device?.address) hostDevice = null
+                    log("DESCONECTADO de ${nameOf(device)}")
+                    if (isCapturing) runOnUiThread { releaseCapture() }
+                }
+            }
+            updateStatus()
+        }
+
+        override fun onGetReport(device: BluetoothDevice?, type: Byte, id: Byte, bufferSize: Int) {
+            hidDevice?.replyReport(device, type, id, ByteArray(if (id.toInt() == 1) 8 else 4))
+        }
+
+        override fun onSetReport(device: BluetoothDevice?, type: Byte, id: Byte, data: ByteArray?) {
+            hidDevice?.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS)
+        }
+    }
+
+    // ---------- Conexión con la Y700 ----------
+
+    private fun bondedList(): List<BluetoothDevice> =
+        btAdapter?.bondedDevices?.toList()?.sortedBy { it.name ?: "" } ?: emptyList()
+
+    private fun connectToLast(silent: Boolean): Boolean {
+        val hid = hidDevice ?: return false
+        if (!isRegistered) return false
+        val addr = getSharedPreferences("mc", MODE_PRIVATE).getString("host", null) ?: return false
+        val dev = bondedList().firstOrNull { it.address == addr }
+        if (dev == null) {
+            if (!silent) log("La tablet guardada ya no está emparejada. Toca Elegir tablet.")
+            return false
+        }
+        if (hostDevice?.address == dev.address) return true
+        log("Conectando con ${nameOf(dev)}...")
+        return hid.connect(dev)
+    }
+
+    private fun connectToLastOrAsk() {
+        if (!isRegistered) {
+            log("El HID no está activo. Toca Reiniciar.")
+            return
+        }
+        if (!connectToLast(silent = false)) pickHost()
+    }
+
+    private fun pickHost() {
+        if (!isRegistered) {
+            log("El HID no está activo. Toca Reiniciar.")
+            return
+        }
+        val devices = bondedList()
+        if (devices.isEmpty()) {
+            log("No hay tablets emparejadas. Empareja primero desde Ajustes > Bluetooth.")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("¿Con cuál tablet?")
+            .setItems(devices.map { nameOf(it) }.toTypedArray()) { _, i ->
+                val dev = devices[i]
+                getSharedPreferences("mc", MODE_PRIVATE).edit().putString("host", dev.address).apply()
+                log("Conectando con ${nameOf(dev)}...")
+                hidDevice?.connect(dev)
+            }
+            .show()
+    }
+
+    // ---------- Captura de teclado y mouse ----------
 
     private fun startCapture() {
-        if (connectedHost == null) {
-            log("No hay tablet conectada todavía. Toca ↺ o conecta desde la Y700.")
-            updateCaptureZoneUi()
+        if (hostDevice == null) {
+            log("Aún no hay conexión con la otra tablet. No se activa la captura.")
             return
-        }
-        synchronized(mouseLock) {
-            accDx = 0f
-            accDy = 0f
-            accWheel = 0f
-            currentButtons = 0
-            lastSentButtons = 0
         }
         captureZone.requestFocus()
         captureZone.requestPointerCapture()
     }
 
     private fun releaseCapture() {
-        try {
-            captureZone.releasePointerCapture()
-        } catch (_: Exception) {}
-        synchronized(mouseLock) {
-            accDx = 0f
-            accDy = 0f
-            accWheel = 0f
-            currentButtons = 0
-            lastSentButtons = 0
-        }
+        captureZone.releasePointerCapture()
         pressedKeys.clear()
-        sendKeyReport(0)
-        sendBleReport(mouseReportChar, byteArrayOf(0, 0, 0, 0), trackBusy = false)
+        sendReport(1, ByteArray(8))
+        sendReport(2, ByteArray(4))
+        lastButtons = 0
     }
 
     override fun onPointerCaptureChanged(hasCapture: Boolean) {
         super.onPointerCaptureChanged(hasCapture)
         isCapturing = hasCapture
-        updateCaptureZoneUi()
+        runOnUiThread { showCaptureText(hasCapture) }
+        log(if (hasCapture) "Captura ACTIVA." else "Captura liberada: control devuelto a esta tablet.")
     }
 
-    @Suppress("DEPRECATION")
-    @SuppressLint("MissingPermission")
-    private fun sendBleReport(char: BluetoothGattCharacteristic?, data: ByteArray, trackBusy: Boolean = true) {
-        val host = connectedHost ?: return
-        val server = gattServer ?: return
-        val c = char ?: return
+    private fun sendReport(id: Int, data: ByteArray) {
+        val host = hostDevice ?: return
         try {
-            if (trackBusy) {
-                isBleBusy = true
-                lastSendTime = System.currentTimeMillis()
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                server.notifyCharacteristicChanged(host, c, false, data)
-            } else {
-                c.value = data
-                server.notifyCharacteristicChanged(host, c, false)
-            }
-        } catch (_: Exception) {
-            isBleBusy = false
-        }
+            hidDevice?.sendReport(host, id, data)
+        } catch (_: Exception) {}
     }
 
     private fun handleMouseEvent(event: MotionEvent) {
-        var buttonChanged = false
-        synchronized(mouseLock) {
-            var buttons = 0
-            if (event.buttonState and MotionEvent.BUTTON_PRIMARY != 0) buttons = buttons or 0x01
-            if (event.buttonState and MotionEvent.BUTTON_SECONDARY != 0) buttons = buttons or 0x02
-            if (event.buttonState and MotionEvent.BUTTON_TERTIARY != 0) buttons = buttons or 0x04
-            if (buttons != currentButtons) {
-                currentButtons = buttons
-                buttonChanged = true
-            }
+        var buttons = 0
+        if (event.buttonState and MotionEvent.BUTTON_PRIMARY != 0) buttons = buttons or 0x01
+        if (event.buttonState and MotionEvent.BUTTON_SECONDARY != 0) buttons = buttons or 0x02
+        if (event.buttonState and MotionEvent.BUTTON_TERTIARY != 0) buttons = buttons or 0x04
 
-            when (event.actionMasked) {
-                MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> {
-                    for (i in 0 until event.historySize) {
-                        accDx += event.getHistoricalX(i) * sensitivity
-                        accDy += event.getHistoricalY(i) * sensitivity
-                    }
-                    accDx += event.x * sensitivity
-                    accDy += event.y * sensitivity
-                }
-                MotionEvent.ACTION_SCROLL -> {
-                    accWheel += event.getAxisValue(MotionEvent.AXIS_VSCROLL)
-                }
-            }
+        var dx = 0
+        var dy = 0
+        var wheel = 0
+
+        if (event.actionMasked == MotionEvent.ACTION_MOVE || event.actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
+            // Se acumulan los decimales para que no se pierda movimiento fino ni haya "drift"
+            remX += event.x * sensitivity
+            remY += event.y * sensitivity
+            dx = remX.toInt()
+            dy = remY.toInt()
+            remX -= dx
+            remY -= dy
         }
-        if (buttonChanged) flushMouseReport()
-    }
-
-    private fun flushMouseReport() {
-        if (!isCapturing || connectedHost == null) return
-        val now = System.currentTimeMillis()
-        if (isBleBusy && (now - lastSendTime) < 50L) return
-
-        val report: ByteArray
-        synchronized(mouseLock) {
-            val dx = accDx.toInt().coerceIn(-127, 127)
-            val dy = accDy.toInt().coerceIn(-127, 127)
-            val wheel = accWheel.toInt().coerceIn(-127, 127)
-            val btn = currentButtons
-            val btnChanged = btn != lastSentButtons
-
-            if (dx == 0 && dy == 0 && wheel == 0 && !btnChanged) return
-
-            accDx -= dx
-            accDy -= dy
-            accWheel -= wheel
-            lastSentButtons = btn
-            report = byteArrayOf(btn.toByte(), dx.toByte(), dy.toByte(), wheel.toByte())
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
+            wheel = event.getAxisValue(MotionEvent.AXIS_VSCROLL).toInt().coerceIn(-127, 127)
         }
-        sendBleReport(mouseReportChar, report, trackBusy = true)
+
+        if (dx == 0 && dy == 0 && wheel == 0 && buttons == lastButtons) return
+        lastButtons = buttons
+
+        // Si el movimiento es mayor a lo que cabe en un reporte, se envía en partes
+        do {
+            val cx = dx.coerceIn(-127, 127)
+            val cy = dy.coerceIn(-127, 127)
+            sendReport(2, byteArrayOf(buttons.toByte(), cx.toByte(), cy.toByte(), wheel.toByte()))
+            dx -= cx
+            dy -= cy
+            wheel = 0
+        } while (dx != 0 || dy != 0)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (!isCapturing) return super.dispatchKeyEvent(event)
-
-        if (event.action == KeyEvent.ACTION_DOWN &&
+        val isToggle = event.action == KeyEvent.ACTION_DOWN &&
             event.keyCode == KeyEvent.KEYCODE_SPACE &&
             event.isCtrlPressed && event.isShiftPressed
-        ) {
+
+        if (!isCapturing) {
+            if (isToggle) {
+                startCapture()
+                return true
+            }
+            return super.dispatchKeyEvent(event)
+        }
+
+        if (isToggle) {
             releaseCapture()
             return true
         }
@@ -842,49 +436,51 @@ class MainActivity : Activity() {
         if (event.isAltPressed) mod = mod or 0x04
         if (event.isMetaPressed) mod = mod or 0x08
 
-        sendKeyReport(mod)
-        return true
-    }
-
-    private fun sendKeyReport(modifier: Int) {
         val report = ByteArray(8)
-        report[0] = modifier.toByte()
+        report[0] = mod.toByte()
         var i = 2
         for (k in pressedKeys) {
             if (i < 8) report[i++] = k
         }
-        sendBleReport(keyboardReportChar, report, trackBusy = false)
+        sendReport(1, report)
+        return true
     }
 
-    private val keyMap = mapOf(
-        KeyEvent.KEYCODE_A to 0x04.toByte(), KeyEvent.KEYCODE_B to 0x05.toByte(),
-        KeyEvent.KEYCODE_C to 0x06.toByte(), KeyEvent.KEYCODE_D to 0x07.toByte(),
-        KeyEvent.KEYCODE_E to 0x08.toByte(), KeyEvent.KEYCODE_F to 0x09.toByte(),
-        KeyEvent.KEYCODE_G to 0x0A.toByte(), KeyEvent.KEYCODE_H to 0x0B.toByte(),
-        KeyEvent.KEYCODE_I to 0x0C.toByte(), KeyEvent.KEYCODE_J to 0x0D.toByte(),
-        KeyEvent.KEYCODE_K to 0x0E.toByte(), KeyEvent.KEYCODE_L to 0x0F.toByte(),
-        KeyEvent.KEYCODE_M to 0x10.toByte(), KeyEvent.KEYCODE_N to 0x11.toByte(),
-        KeyEvent.KEYCODE_O to 0x12.toByte(), KeyEvent.KEYCODE_P to 0x13.toByte(),
-        KeyEvent.KEYCODE_Q to 0x14.toByte(), KeyEvent.KEYCODE_R to 0x15.toByte(),
-        KeyEvent.KEYCODE_S to 0x16.toByte(), KeyEvent.KEYCODE_T to 0x17.toByte(),
-        KeyEvent.KEYCODE_U to 0x18.toByte(), KeyEvent.KEYCODE_V to 0x19.toByte(),
-        KeyEvent.KEYCODE_W to 0x1A.toByte(), KeyEvent.KEYCODE_X to 0x1B.toByte(),
-        KeyEvent.KEYCODE_Y to 0x1C.toByte(), KeyEvent.KEYCODE_Z to 0x1D.toByte(),
-        KeyEvent.KEYCODE_1 to 0x1E.toByte(), KeyEvent.KEYCODE_2 to 0x1F.toByte(),
-        KeyEvent.KEYCODE_3 to 0x20.toByte(), KeyEvent.KEYCODE_4 to 0x21.toByte(),
-        KeyEvent.KEYCODE_5 to 0x22.toByte(), KeyEvent.KEYCODE_6 to 0x23.toByte(),
-        KeyEvent.KEYCODE_7 to 0x24.toByte(), KeyEvent.KEYCODE_8 to 0x25.toByte(),
-        KeyEvent.KEYCODE_9 to 0x26.toByte(), KeyEvent.KEYCODE_0 to 0x27.toByte(),
-        KeyEvent.KEYCODE_ENTER to 0x28.toByte(), KeyEvent.KEYCODE_ESCAPE to 0x29.toByte(),
-        KeyEvent.KEYCODE_DEL to 0x2A.toByte(), KeyEvent.KEYCODE_TAB to 0x2B.toByte(),
-        KeyEvent.KEYCODE_SPACE to 0x2C.toByte(), KeyEvent.KEYCODE_MINUS to 0x2D.toByte(),
-        KeyEvent.KEYCODE_EQUALS to 0x2E.toByte(), KeyEvent.KEYCODE_LEFT_BRACKET to 0x2F.toByte(),
-        KeyEvent.KEYCODE_RIGHT_BRACKET to 0x30.toByte(), KeyEvent.KEYCODE_BACKSLASH to 0x31.toByte(),
-        KeyEvent.KEYCODE_SEMICOLON to 0x33.toByte(), KeyEvent.KEYCODE_APOSTROPHE to 0x34.toByte(),
-        KeyEvent.KEYCODE_GRAVE to 0x35.toByte(), KeyEvent.KEYCODE_COMMA to 0x36.toByte(),
-        KeyEvent.KEYCODE_PERIOD to 0x37.toByte(), KeyEvent.KEYCODE_SLASH to 0x38.toByte(),
-        KeyEvent.KEYCODE_FORWARD_DEL to 0x4C.toByte(),
-        KeyEvent.KEYCODE_DPAD_RIGHT to 0x4F.toByte(), KeyEvent.KEYCODE_DPAD_LEFT to 0x50.toByte(),
-        KeyEvent.KEYCODE_DPAD_DOWN to 0x51.toByte(), KeyEvent.KEYCODE_DPAD_UP to 0x52.toByte()
-    )
+    private val keyMap: Map<Int, Byte> = buildMap {
+        // Letras A-Z -> 0x04..0x1D
+        for (i in 0 until 26) put(KeyEvent.KEYCODE_A + i, (0x04 + i).toByte())
+        // Números 1-9 -> 0x1E..0x26, 0 -> 0x27
+        for (i in 0 until 9) put(KeyEvent.KEYCODE_1 + i, (0x1E + i).toByte())
+        put(KeyEvent.KEYCODE_0, 0x27.toByte())
+        // Teclas de función F1-F12 -> 0x3A..0x45
+        for (i in 0 until 12) put(KeyEvent.KEYCODE_F1 + i, (0x3A + i).toByte())
+
+        put(KeyEvent.KEYCODE_ENTER, 0x28.toByte())
+        put(KeyEvent.KEYCODE_ESCAPE, 0x29.toByte())
+        put(KeyEvent.KEYCODE_DEL, 0x2A.toByte())
+        put(KeyEvent.KEYCODE_TAB, 0x2B.toByte())
+        put(KeyEvent.KEYCODE_SPACE, 0x2C.toByte())
+        put(KeyEvent.KEYCODE_MINUS, 0x2D.toByte())
+        put(KeyEvent.KEYCODE_EQUALS, 0x2E.toByte())
+        put(KeyEvent.KEYCODE_LEFT_BRACKET, 0x2F.toByte())
+        put(KeyEvent.KEYCODE_RIGHT_BRACKET, 0x30.toByte())
+        put(KeyEvent.KEYCODE_BACKSLASH, 0x31.toByte())
+        put(KeyEvent.KEYCODE_SEMICOLON, 0x33.toByte())
+        put(KeyEvent.KEYCODE_APOSTROPHE, 0x34.toByte())
+        put(KeyEvent.KEYCODE_GRAVE, 0x35.toByte())
+        put(KeyEvent.KEYCODE_COMMA, 0x36.toByte())
+        put(KeyEvent.KEYCODE_PERIOD, 0x37.toByte())
+        put(KeyEvent.KEYCODE_SLASH, 0x38.toByte())
+        put(KeyEvent.KEYCODE_CAPS_LOCK, 0x39.toByte())
+        put(KeyEvent.KEYCODE_INSERT, 0x49.toByte())
+        put(KeyEvent.KEYCODE_MOVE_HOME, 0x4A.toByte())
+        put(KeyEvent.KEYCODE_PAGE_UP, 0x4B.toByte())
+        put(KeyEvent.KEYCODE_FORWARD_DEL, 0x4C.toByte())
+        put(KeyEvent.KEYCODE_MOVE_END, 0x4D.toByte())
+        put(KeyEvent.KEYCODE_PAGE_DOWN, 0x4E.toByte())
+        put(KeyEvent.KEYCODE_DPAD_RIGHT, 0x4F.toByte())
+        put(KeyEvent.KEYCODE_DPAD_LEFT, 0x50.toByte())
+        put(KeyEvent.KEYCODE_DPAD_DOWN, 0x51.toByte())
+        put(KeyEvent.KEYCODE_DPAD_UP, 0x52.toByte())
+    }
 }
